@@ -26,6 +26,7 @@ import pandas as pd
 
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
@@ -48,6 +49,7 @@ DROP_COLS = [
     "agency",
     "agent",
     "date_added",      # engineered into year_added / month_added instead
+    "date_added",      # engineered into year_added / month_added instead
     "area",            # redundant with Area Size + Area Type
 ]
 
@@ -57,7 +59,9 @@ NUMERIC_FEATURES = [
     "baths",
     "bedrooms",
     "area_marla",      # engineered: Area Size normalized to a single unit (Marla)
+    "area_marla",      # engineered: Area Size normalized to a single unit (Marla)
     "year_added",      # engineered from date_added
+    "month_added",     # engineered from date_added
     "month_added",     # engineered from date_added
 ]
 
@@ -70,6 +74,31 @@ CATEGORICAL_FEATURES = [
     "Area Category",
 ]
 
+# 1 Kanal = 20 Marla, 1 Sq. Yard = 1/30.25 Marla, 1 Sq. Ft = 1/272.25 Marla (approx, PK convention)
+AREA_TYPE_TO_MARLA = {
+    "Marla": 1.0,
+    "Kanal": 20.0,
+    "Sq. Yards": 1.0 / 30.25,
+    "Sq. Yard": 1.0 / 30.25,
+    "Sq. Ft.": 1.0 / 272.25,
+    "Sq. Ft": 1.0 / 272.25,
+}
+
+# Categorical levels that appear fewer than this many times get folded into "Other"
+RARE_CATEGORY_MIN_COUNT = 20
+
+# Price values outside these percentiles are clipped (guards against fat-finger /
+# placeholder listings without throwing away rows)
+PRICE_LOWER_PCT = 0.01
+PRICE_UPPER_PCT = 0.99
+
+
+# --------------------------------------------------------------------------
+# Feature engineering / preprocessing helpers
+# --------------------------------------------------------------------------
+
+def engineer_date_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Turn date_added (dd-mm-yyyy) into numeric year/month features."""
 # 1 Kanal = 20 Marla, 1 Sq. Yard = 1/30.25 Marla, 1 Sq. Ft = 1/272.25 Marla (approx, PK convention)
 AREA_TYPE_TO_MARLA = {
     "Marla": 1.0,
@@ -149,6 +178,57 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = engineer_date_features(df)
     df = engineer_area_marla(df)
     df = group_rare_categories(df, CATEGORICAL_FEATURES, RARE_CATEGORY_MIN_COUNT)
+        df["month_added"] = parsed.dt.month
+    else:
+        df["year_added"] = np.nan
+        df["month_added"] = np.nan
+    return df
+
+
+def engineer_area_marla(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize `Area Size` into a single consistent unit (Marla) using `Area Type`,
+    since raw Area Size is not comparable across rows recorded in Marla vs Kanal
+    vs Sq. Ft. etc. Unknown/unmapped area types fall back to NaN and get imputed
+    later in the pipeline.
+    """
+    if "Area Size" in df.columns and "Area Type" in df.columns:
+        factor = df["Area Type"].map(AREA_TYPE_TO_MARLA)
+        df["area_marla"] = df["Area Size"] * factor
+    else:
+        df["area_marla"] = np.nan
+    return df
+
+
+def group_rare_categories(df: pd.DataFrame, columns, min_count: int) -> pd.DataFrame:
+    """Collapse infrequent categorical levels into 'Other' so the encoder doesn't
+    blow up the feature space with one-off values and so rare/unseen values at
+    inference time behave predictably."""
+    for col in columns:
+        if col not in df.columns:
+            continue
+        counts = df[col].value_counts()
+        rare = counts[counts < min_count].index
+        df[col] = df[col].where(~df[col].isin(rare), other="Other")
+    return df
+
+
+def clip_price_outliers(df: pd.DataFrame, lower_pct: float, upper_pct: float) -> pd.DataFrame:
+    """Clip extreme price values to the given percentiles instead of dropping rows,
+    so the model isn't skewed by a handful of placeholder / data-entry-error prices."""
+    lower = df[TARGET].quantile(lower_pct)
+    upper = df[TARGET].quantile(upper_pct)
+    df[TARGET] = df[TARGET].clip(lower=lower, upper=upper)
+    return df
+
+
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    df = engineer_date_features(df)
+    df = engineer_area_marla(df)
+    df = group_rare_categories(df, CATEGORICAL_FEATURES, RARE_CATEGORY_MIN_COUNT)
 
     return df
 
@@ -162,10 +242,18 @@ def load_data(path: str) -> pd.DataFrame:
 # Model pipeline
 # --------------------------------------------------------------------------
 
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    return preprocess(df)
+
+
+# --------------------------------------------------------------------------
+# Model pipeline
+# --------------------------------------------------------------------------
+
 def build_pipeline() -> Pipeline:
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
     ])
 
     categorical_transformer = Pipeline(steps=[
@@ -177,6 +265,14 @@ def build_pipeline() -> Pipeline:
         ("num", numeric_transformer, NUMERIC_FEATURES),
         ("cat", categorical_transformer, CATEGORICAL_FEATURES),
     ])
+    # Feature tuning: fit a quick RandomForest to rank feature importance, then
+    # automatically drop features below the median importance. This trims noisy
+    # one-hot columns (e.g. rare categories that slipped past grouping) and low-
+    # signal numeric features before the final model is trained.
+    feature_tuning = SelectFromModel(
+        estimator=RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+        threshold="median",
+    )
 
     model = RandomForestRegressor(
         n_estimators=300,
@@ -188,6 +284,7 @@ def build_pipeline() -> Pipeline:
 
     pipeline = Pipeline(steps=[
         ("preprocessor", preprocessor),
+        ("feature_tuning", feature_tuning),
         ("model", model),
     ])
 
