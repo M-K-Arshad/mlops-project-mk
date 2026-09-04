@@ -1,25 +1,21 @@
 """
 src/train_mk.py
-----------------
+---------------
 Trains a RandomForest model to predict property `price` from the
 Zameen-style property listings dataset.
 
-Repo layout this script expects (relative to project root):
-    data/<csv file>      -> input dataset(s)
-    model/model.joblib    -> trained pipeline is written here
+Run from the project root:
 
-Usage (from project root, per README):
     python src/train_mk.py
-    python src/train_mk.py --data data/properties.csv --out model/model.joblib
 
-Expected columns (from the dataset header):
-    property_id, location_id, page_url, property_type, price, location,
-    city, province_name, latitude, longitude, baths, area, purpose,
-    bedrooms, date_added, agency, agent, Area Type, Area Size, Area Category
+Or specify your own dataset/output:
+
+    python src/train_mk.py --data data/properties.csv --out model/model.joblib
 """
 
 import argparse
 import os
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -35,34 +31,19 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 # --------------------------------------------------------------------------
-# Config: which columns to use and how
+# Configuration
 # --------------------------------------------------------------------------
 
 TARGET = "price"
-
-# Columns that are identifiers / free text / leakage-prone -> dropped
-DROP_COLS = [
-    "property_id",
-    "location_id",
-    "page_url",
-    "location",       # very high-cardinality text; city/province capture geo info
-    "agency",
-    "agent",
-    "date_added",      # engineered into year_added / month_added instead
-    "date_added",      # engineered into year_added / month_added instead
-    "area",            # redundant with Area Size + Area Type
-]
 
 NUMERIC_FEATURES = [
     "latitude",
     "longitude",
     "baths",
     "bedrooms",
-    "area_marla",      # engineered: Area Size normalized to a single unit (Marla)
-    "area_marla",      # engineered: Area Size normalized to a single unit (Marla)
-    "year_added",      # engineered from date_added
-    "month_added",     # engineered from date_added
-    "month_added",     # engineered from date_added
+    "area_marla",
+    "year_added",
+    "month_added",
 ]
 
 CATEGORICAL_FEATURES = [
@@ -74,7 +55,7 @@ CATEGORICAL_FEATURES = [
     "Area Category",
 ]
 
-# 1 Kanal = 20 Marla, 1 Sq. Yard = 1/30.25 Marla, 1 Sq. Ft = 1/272.25 Marla (approx, PK convention)
+# Convert different area units into Marla.
 AREA_TYPE_TO_MARLA = {
     "Marla": 1.0,
     "Kanal": 20.0,
@@ -84,271 +65,456 @@ AREA_TYPE_TO_MARLA = {
     "Sq. Ft": 1.0 / 272.25,
 }
 
-# Categorical levels that appear fewer than this many times get folded into "Other"
+# Categories occurring fewer than this number of times
+# are grouped into "Other".
 RARE_CATEGORY_MIN_COUNT = 20
 
-# Price values outside these percentiles are clipped (guards against fat-finger /
-# placeholder listings without throwing away rows)
+# Percentiles used to clip extreme price values.
 PRICE_LOWER_PCT = 0.01
 PRICE_UPPER_PCT = 0.99
 
 
 # --------------------------------------------------------------------------
-# Feature engineering / preprocessing helpers
+# Feature Engineering
 # --------------------------------------------------------------------------
 
 def engineer_date_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Turn date_added (dd-mm-yyyy) into numeric year/month features."""
-# 1 Kanal = 20 Marla, 1 Sq. Yard = 1/30.25 Marla, 1 Sq. Ft = 1/272.25 Marla (approx, PK convention)
-AREA_TYPE_TO_MARLA = {
-    "Marla": 1.0,
-    "Kanal": 20.0,
-    "Sq. Yards": 1.0 / 30.25,
-    "Sq. Yard": 1.0 / 30.25,
-    "Sq. Ft.": 1.0 / 272.25,
-    "Sq. Ft": 1.0 / 272.25,
-}
+    """Convert date_added into numeric year and month features."""
 
-# Categorical levels that appear fewer than this many times get folded into "Other"
-RARE_CATEGORY_MIN_COUNT = 20
-
-# Price values outside these percentiles are clipped (guards against fat-finger /
-# placeholder listings without throwing away rows)
-PRICE_LOWER_PCT = 0.01
-PRICE_UPPER_PCT = 0.99
-
-
-# --------------------------------------------------------------------------
-# Feature engineering / preprocessing helpers
-# --------------------------------------------------------------------------
-
-def engineer_date_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Turn date_added (dd-mm-yyyy) into numeric year/month features."""
     if "date_added" in df.columns:
-        parsed = pd.to_datetime(df["date_added"], format="%d-%m-%Y", errors="coerce")
+        parsed = pd.to_datetime(
+            df["date_added"],
+            format="%d-%m-%Y",
+            errors="coerce"
+        )
+
         df["year_added"] = parsed.dt.year
         df["month_added"] = parsed.dt.month
+
     else:
         df["year_added"] = np.nan
         df["month_added"] = np.nan
+
     return df
 
 
 def engineer_area_marla(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize `Area Size` into a single consistent unit (Marla) using `Area Type`,
-    since raw Area Size is not comparable across rows recorded in Marla vs Kanal
-    vs Sq. Ft. etc. Unknown/unmapped area types fall back to NaN and get imputed
-    later in the pipeline.
+    Convert Area Size into Marla using Area Type.
+
+    This makes area measurements comparable when the dataset contains
+    Marla, Kanal, Sq. Yards, or Sq. Ft.
     """
+
     if "Area Size" in df.columns and "Area Type" in df.columns:
+
+        # Ensure Area Size is numeric.
+        area_size = pd.to_numeric(
+            df["Area Size"],
+            errors="coerce"
+        )
+
         factor = df["Area Type"].map(AREA_TYPE_TO_MARLA)
-        df["area_marla"] = df["Area Size"] * factor
+
+        df["area_marla"] = area_size * factor
+
     else:
         df["area_marla"] = np.nan
+
     return df
 
 
-def group_rare_categories(df: pd.DataFrame, columns, min_count: int) -> pd.DataFrame:
-    """Collapse infrequent categorical levels into 'Other' so the encoder doesn't
-    blow up the feature space with one-off values and so rare/unseen values at
-    inference time behave predictably."""
+def group_rare_categories(
+    df: pd.DataFrame,
+    columns,
+    min_count: int
+) -> pd.DataFrame:
+    """
+    Replace infrequent categorical values with 'Other'.
+    """
+
     for col in columns:
+
         if col not in df.columns:
             continue
+
         counts = df[col].value_counts()
-        rare = counts[counts < min_count].index
-        df[col] = df[col].where(~df[col].isin(rare), other="Other")
-    return df
 
+        rare_values = counts[
+            counts < min_count
+        ].index
 
-def clip_price_outliers(df: pd.DataFrame, lower_pct: float, upper_pct: float) -> pd.DataFrame:
-    """Clip extreme price values to the given percentiles instead of dropping rows,
-    so the model isn't skewed by a handful of placeholder / data-entry-error prices."""
-    lower = df[TARGET].quantile(lower_pct)
-    upper = df[TARGET].quantile(upper_pct)
-    df[TARGET] = df[TARGET].clip(lower=lower, upper=upper)
+        df[col] = df[col].where(
+            ~df[col].isin(rare_values),
+            other="Other"
+        )
+
     return df
 
 
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    """Perform all feature engineering and preprocessing."""
+
     df = df.copy()
+
+    # Remove accidental whitespace from column names.
     df.columns = [c.strip() for c in df.columns]
 
+    # Convert relevant numeric columns.
+    numeric_columns = [
+        "price",
+        "latitude",
+        "longitude",
+        "baths",
+        "bedrooms",
+        "Area Size",
+    ]
+
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
+
+    # Feature engineering.
     df = engineer_date_features(df)
     df = engineer_area_marla(df)
-    df = group_rare_categories(df, CATEGORICAL_FEATURES, RARE_CATEGORY_MIN_COUNT)
-        df["month_added"] = parsed.dt.month
-    else:
-        df["year_added"] = np.nan
-        df["month_added"] = np.nan
+
+    # Handle rare categorical values.
+    df = group_rare_categories(
+        df,
+        CATEGORICAL_FEATURES,
+        RARE_CATEGORY_MIN_COUNT
+    )
+
     return df
 
 
-def engineer_area_marla(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize `Area Size` into a single consistent unit (Marla) using `Area Type`,
-    since raw Area Size is not comparable across rows recorded in Marla vs Kanal
-    vs Sq. Ft. etc. Unknown/unmapped area types fall back to NaN and get imputed
-    later in the pipeline.
-    """
-    if "Area Size" in df.columns and "Area Type" in df.columns:
-        factor = df["Area Type"].map(AREA_TYPE_TO_MARLA)
-        df["area_marla"] = df["Area Size"] * factor
-    else:
-        df["area_marla"] = np.nan
-    return df
+def clip_price_outliers(
+    df: pd.DataFrame,
+    lower_pct: float,
+    upper_pct: float
+) -> pd.DataFrame:
+    """Clip extreme target values instead of removing rows."""
 
-
-def group_rare_categories(df: pd.DataFrame, columns, min_count: int) -> pd.DataFrame:
-    """Collapse infrequent categorical levels into 'Other' so the encoder doesn't
-    blow up the feature space with one-off values and so rare/unseen values at
-    inference time behave predictably."""
-    for col in columns:
-        if col not in df.columns:
-            continue
-        counts = df[col].value_counts()
-        rare = counts[counts < min_count].index
-        df[col] = df[col].where(~df[col].isin(rare), other="Other")
-    return df
-
-
-def clip_price_outliers(df: pd.DataFrame, lower_pct: float, upper_pct: float) -> pd.DataFrame:
-    """Clip extreme price values to the given percentiles instead of dropping rows,
-    so the model isn't skewed by a handful of placeholder / data-entry-error prices."""
     lower = df[TARGET].quantile(lower_pct)
     upper = df[TARGET].quantile(upper_pct)
-    df[TARGET] = df[TARGET].clip(lower=lower, upper=upper)
-    return df
 
-
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
-
-    df = engineer_date_features(df)
-    df = engineer_area_marla(df)
-    df = group_rare_categories(df, CATEGORICAL_FEATURES, RARE_CATEGORY_MIN_COUNT)
+    df[TARGET] = df[TARGET].clip(
+        lower=lower,
+        upper=upper
+    )
 
     return df
 
 
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    return preprocess(df)
-
-
 # --------------------------------------------------------------------------
-# Model pipeline
+# Data Loading
 # --------------------------------------------------------------------------
 
 def load_data(path: str) -> pd.DataFrame:
+    """Load CSV data and apply preprocessing."""
+
+    print(f"Loading dataset from: {path}")
+
     df = pd.read_csv(path)
-    return preprocess(df)
+
+    print(f"Dataset loaded: {len(df)} rows")
+
+    df = preprocess(df)
+
+    return df
 
 
 # --------------------------------------------------------------------------
-# Model pipeline
+# Machine Learning Pipeline
 # --------------------------------------------------------------------------
 
 def build_pipeline() -> Pipeline:
-    numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-    ])
+    """Build the preprocessing + feature selection + RandomForest pipeline."""
 
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-    ])
+    # Numeric preprocessing.
+    numeric_transformer = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="median")
+            ),
 
-    preprocessor = ColumnTransformer(transformers=[
-        ("num", numeric_transformer, NUMERIC_FEATURES),
-        ("cat", categorical_transformer, CATEGORICAL_FEATURES),
-    ])
-    # Feature tuning: fit a quick RandomForest to rank feature importance, then
-    # automatically drop features below the median importance. This trims noisy
-    # one-hot columns (e.g. rare categories that slipped past grouping) and low-
-    # signal numeric features before the final model is trained.
-    feature_tuning = SelectFromModel(
-        estimator=RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
-        threshold="median",
+            # Required feature scaling step.
+            (
+                "scaler",
+                StandardScaler()
+            ),
+        ]
     )
 
+    # Categorical preprocessing.
+    categorical_transformer = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="most_frequent")
+            ),
+
+            (
+                "onehot",
+                OneHotEncoder(
+                    handle_unknown="ignore"
+                )
+            ),
+        ]
+    )
+
+    # Combine numeric and categorical preprocessing.
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                numeric_transformer,
+                NUMERIC_FEATURES
+            ),
+
+            (
+                "cat",
+                categorical_transformer,
+                CATEGORICAL_FEATURES
+            ),
+        ]
+    )
+
+    # Feature selection.
+    feature_tuning = SelectFromModel(
+        estimator=RandomForestRegressor(
+            n_estimators=100,
+            random_state=42,
+            n_jobs=-1
+        ),
+        threshold="median"
+    )
+
+    # Final RandomForest model.
     model = RandomForestRegressor(
         n_estimators=300,
         max_depth=None,
         min_samples_leaf=2,
         n_jobs=-1,
-        random_state=42,
+        random_state=42
     )
 
-    pipeline = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("feature_tuning", feature_tuning),
-        ("model", model),
-    ])
+    pipeline = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                preprocessor
+            ),
+
+            (
+                "feature_tuning",
+                feature_tuning
+            ),
+
+            (
+                "model",
+                model
+            ),
+        ]
+    )
 
     return pipeline
 
 
+# --------------------------------------------------------------------------
+# Main Training Function
+# --------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Train a RandomForest price predictor.")
+
+    parser = argparse.ArgumentParser(
+        description="Train a RandomForest property price predictor."
+    )
+
     parser.add_argument(
         "--data",
         default="data/zameen-updated.csv",
-        help="Path to input CSV file (default: data/zameen-updated.csv).",
+        help="Path to the input CSV dataset."
     )
+
     parser.add_argument(
         "--out",
         default="model/model.joblib",
-        help="Path to save trained model (default: model/model.joblib).",
+        help="Path where the trained model will be saved."
     )
-    parser.add_argument("--test-size", type=float, default=0.2, help="Test set fraction.")
-    parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
+
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help="Fraction of data used for testing."
+    )
+
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility."
+    )
+
     args = parser.parse_args()
 
-    print(f"Loading data from {args.data} ...")
+    # ----------------------------------------------------------------------
+    # Load dataset
+    # ----------------------------------------------------------------------
+
     df = load_data(args.data)
 
-    missing_cols = [c for c in NUMERIC_FEATURES + CATEGORICAL_FEATURES + [TARGET] if c not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing expected columns in dataset: {missing_cols}")
+    # ----------------------------------------------------------------------
+    # Validate required columns
+    # ----------------------------------------------------------------------
 
-    # Drop rows with missing target
-    df = df.dropna(subset=[TARGET])
-
-    # Filter out non-positive prices, then clip remaining extreme outliers
-    df = df[df[TARGET] > 0]
-    df = clip_price_outliers(df, PRICE_LOWER_PCT, PRICE_UPPER_PCT)
-
-    X = df[NUMERIC_FEATURES + CATEGORICAL_FEATURES]
-    y = df[TARGET]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=args.random_state
+    required_columns = (
+        NUMERIC_FEATURES
+        + CATEGORICAL_FEATURES
+        + [TARGET]
     )
 
-    print(f"Training on {len(X_train)} rows, testing on {len(X_test)} rows ...")
+    missing_columns = [
+        col
+        for col in required_columns
+        if col not in df.columns
+    ]
+
+    if missing_columns:
+
+        raise ValueError(
+            f"Missing expected columns in dataset: "
+            f"{missing_columns}"
+        )
+
+    # ----------------------------------------------------------------------
+    # Clean target
+    # ----------------------------------------------------------------------
+
+    # Remove rows where price is missing.
+    df = df.dropna(
+        subset=[TARGET]
+    )
+
+    # Remove invalid/non-positive prices.
+    df = df[
+        df[TARGET] > 0
+    ]
+
+    # Clip extreme prices.
+    df = clip_price_outliers(
+        df,
+        PRICE_LOWER_PCT,
+        PRICE_UPPER_PCT
+    )
+
+    # ----------------------------------------------------------------------
+    # Prepare X and y
+    # ----------------------------------------------------------------------
+
+    X = df[
+        NUMERIC_FEATURES
+        + CATEGORICAL_FEATURES
+    ]
+
+    y = df[TARGET]
+
+    # ----------------------------------------------------------------------
+    # Train/test split
+    # ----------------------------------------------------------------------
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=args.test_size,
+        random_state=args.random_state
+    )
+
+    print(
+        f"Training samples: {len(X_train)}"
+    )
+
+    print(
+        f"Testing samples: {len(X_test)}"
+    )
+
+    # ----------------------------------------------------------------------
+    # Build and train model
+    # ----------------------------------------------------------------------
+
+    print("\nTraining RandomForest model...")
+
     pipeline = build_pipeline()
-    pipeline.fit(X_train, y_train)
 
-    preds = pipeline.predict(X_test)
-    mae = mean_absolute_error(y_test, preds)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-    r2 = r2_score(y_test, preds)
+    pipeline.fit(
+        X_train,
+        y_train
+    )
 
-    print("\nEvaluation on held-out test set:")
-    print(f"  MAE  : {mae:,.0f}")
-    print(f"  RMSE : {rmse:,.0f}")
-    print(f"  R^2  : {r2:.4f}")
+    print("Training completed.")
 
-    out_dir = os.path.dirname(args.out)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    # ----------------------------------------------------------------------
+    # Evaluate model
+    # ----------------------------------------------------------------------
 
-    joblib.dump(pipeline, args.out)
-    print(f"\nSaved trained pipeline to {args.out}")
+    predictions = pipeline.predict(
+        X_test
+    )
 
+    mae = mean_absolute_error(
+        y_test,
+        predictions
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            y_test,
+            predictions
+        )
+    )
+
+    r2 = r2_score(
+        y_test,
+        predictions
+    )
+
+    print("\nEvaluation on test set:")
+    print(f"MAE  : {mae:,.0f}")
+    print(f"RMSE : {rmse:,.0f}")
+    print(f"R^2  : {r2:.4f}")
+
+    # ----------------------------------------------------------------------
+    # Save model
+    # ----------------------------------------------------------------------
+
+    output_directory = os.path.dirname(
+        args.out
+    )
+
+    if output_directory:
+        os.makedirs(
+            output_directory,
+            exist_ok=True
+        )
+
+    joblib.dump(
+        pipeline,
+        args.out
+    )
+
+    print(
+        f"\nSaved trained model to: {args.out}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Entry Point
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
